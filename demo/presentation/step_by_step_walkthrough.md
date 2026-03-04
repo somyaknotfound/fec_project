@@ -100,70 +100,129 @@ Step 32 ▸  STOP the capture
 
 > **This is the main event. Take your time.**
 
+### ⚡ Set Up Kernel-Level Packet Loss (CRITICAL STEP)
+```
+Step 33 ▸  In Terminal 2, enable 30% kernel-level packet loss:
+              sudo tc qdisc add dev lo root netem loss 30%
+
+           This makes the Linux KERNEL drop 30% of loopback packets.
+           Wireshark will see the drops because they happen BEFORE capture!
+
+Step 34 ▸  Verify it's active:
+              tc qdisc show dev lo
+           You should see: "qdisc netem ... loss 30%"
+```
+
+> ⚠️ **Why this matters:** Without this step, packet loss is simulated inside the
+> receiver app, and Wireshark would show ALL 16 packets arriving. With `tc netem`,
+> the kernel itself drops packets, so Wireshark genuinely shows missing packets.
+
 ### Wireshark Setup
 ```
-Step 33 ▸  In Wireshark: File → Close (discard previous)
-Step 34 ▸  Change the filter bar to:
+Step 35 ▸  In Wireshark: File → Close (discard previous)
+Step 36 ▸  Change the filter bar to:
               udp.port == 5002
-Step 35 ▸  Start a NEW capture on "Loopback: lo"
+Step 37 ▸  Start a NEW capture on "Loopback: lo"
 ```
 
 ### Run the Demo
 ```
-Step 36 ▸  In Terminal 1, run:
-              python3 demo/demo3_live_recovery.py
-Step 37 ▸  Press Enter when prompted
+Step 38 ▸  In Terminal 1, run:
+              sudo python3 demo/demo3_live_recovery.py
+
+           (Must use sudo so the script can detect netem is active)
+
+Step 39 ▸  Script confirms: "✓ Kernel-level loss active (tc netem)"
+Step 40 ▸  Press Enter when prompted
 ```
 
 ### What to Watch
 ```
-Step 38 ▸  TERMINAL: You'll see interleaved SENDER and RECEIVER lines
+Step 41 ▸  TERMINAL: Sender sends ALL 16 packets
+
               [SENDER]   → Sent      block=0 idx=0 (DATA)
-              [RECEIVER] ✓ Received  block=0 idx=0 (DATA)
               [SENDER]   → Sent      block=0 idx=1 (DATA)
-              [RECEIVER] ✗ DROPPED   block=0 idx=1 (DATA)  ← SIMULATED LOSS!
               ...
 
-Step 39 ▸  Count the RED ✗ lines — these are dropped packets (~5 out of 16)
+Step 42 ▸  TERMINAL: Receiver only gets SOME packets (kernel drops the rest!)
 
-Step 40 ▸  WIRESHARK: Notice fewer packets than 16 appearing
-              (because dropped packets never reach the receiver)
+              [RECEIVER] ✓ Received  block=0 idx=0 (DATA)
+              [RECEIVER] ✓ Received  block=0 idx=2 (DATA)    ← idx=1 MISSING!
+              [RECEIVER] ✓ Received  block=0 idx=3 (DATA)
+              ...
+
+           NOTE: There are NO red ✗ lines — dropped packets simply NEVER
+           arrive at the receiver. This is REAL network-level loss!
+
+Step 43 ▸  WIRESHARK: Count the packets — you'll see ~11 instead of 16!
+              → These are the packets that survived kernel-level drops
+              → The missing ones were dropped by tc netem before capture
 ```
 
 ### After Transmission Finishes
 ```
-Step 41 ▸  TERMINAL shows "FEC DECODING PHASE":
-              Block 0: received 6/8 (lost 1 data + 1 parity)
-                       ✓ DECODED SUCCESSFULLY
-              Block 1: received 5/8 (lost 2 data + 1 parity)
+Step 44 ▸  TERMINAL shows "FEC DECODING PHASE":
+
+              Block 0: received 5/8 (lost 1 data + 2 parity)
+                       Missing indices: [1, 5, 7]
                        ✓ DECODED SUCCESSFULLY
 
-Step 42 ▸  TERMINAL shows final statistics:
-              Packets dropped:    ~5
+              Block 1: received 6/8 (lost 2 data + 0 parity)
+                       Missing indices: [0, 3]
+                       ✓ DECODED SUCCESSFULLY
+
+Step 45 ▸  FINAL STATISTICS:
+              Packets sent:       16
+              Packets received:   ~11
+              Packets lost:       ~5        ← REAL kernel drops!
               Actual loss rate:   ~31%
+              Loss method:        Kernel-level (tc netem)
+
               Blocks decoded:     2/2
               ★ SUCCESS RATE:     100% ★
 
-Step 43 ▸  STOP the Wireshark capture
+           Key line:  "Wireshark shows only ~11 packets!"
 ```
 
-### Wireshark Verification
+### Wireshark Verification (THE PROOF)
 ```
-Step 44 ▸  In Wireshark menu: Statistics → Conversations → UDP tab
-Step 45 ▸  Show the packet count — it will be LESS than 16
-              → This proves packets were actually lost on the wire
-Step 46 ▸  Close the Statistics window
+Step 46 ▸  STOP the Wireshark capture (red square)
+
+Step 47 ▸  COUNT the packets in the packet list:
+              → You'll see approximately 11 packets, NOT 16
+              → The missing 5 were genuinely lost by the kernel!
+
+Step 48 ▸  Statistics → Conversations → UDP tab
+              → Shows exact packet count confirming the loss
+
+Step 49 ▸  COMPARE: Demo 2 had 8/8 packets (no loss)
+                     Demo 3 has ~11/16 packets (30% kernel loss)
+              → Yet the decoder STILL recovered ALL original data!
 ```
 
-> 💬 **Say:** *"Despite losing about 30% of packets — confirmed by Wireshark — the FEC decoder recovered ALL original data using Gaussian elimination over GF(256). No retransmission was needed. This is exactly the property we want for 5G URLLC: reliable delivery without the latency of retransmissions."*
+### 🧹 CLEAN UP (Don't Forget!)
+```
+Step 50 ▸  In Terminal 2, REMOVE the packet loss rule:
+              sudo tc qdisc del dev lo root
+
+Step 51 ▸  Verify it's removed:
+              tc qdisc show dev lo
+           Should show: "qdisc noqueue" or "qdisc fq_codel" (default)
+```
+
+> ⚠️ **IMPORTANT:** Always remove the netem rule after the demo!
+> Otherwise ALL loopback traffic will have 30% loss — breaking DNS,
+> database connections, and other localhost services.
+
+> 💬 **Say:** *"Look at Wireshark — it captured only 11 of 16 packets. The missing 5 were dropped by the Linux kernel's traffic control before they even reached the receiver. This is REAL packet loss, not simulated. Yet the FEC decoder used Gaussian elimination over GF(256) to reconstruct ALL original data from just the surviving packets. No retransmission was needed. This is exactly the property we need for 5G URLLC."*
 
 ---
 
 ## WRAP-UP (2 min)
 
 ```
-Step 47 ▸  Close Wireshark
-Step 48 ▸  (Optional) Show the experiment graphs:
+Step 52 ▸  Close Wireshark
+Step 53 ▸  (Optional) Show the experiment graphs:
               Open: data/results/plr_comparison.png
               Open: data/results/recovery_rate.png
 ```
@@ -178,7 +237,13 @@ Step 48 ▸  (Optional) Show the experiment graphs:
 |------|---------|-----------------|------|----------|
 | 1. Baseline | `python3 demo/demo1_no_fec.py` | `udp.port == 5000` | 5000 | ~10s |
 | 2. Structure | `python3 demo/demo2_with_fec.py` | `udp.port == 5001` | 5001 | ~8s |
-| 3. Recovery ⭐ | `python3 demo/demo3_live_recovery.py` | `udp.port == 5002` | 5002 | ~20s |
+| 3. Recovery ⭐ | `sudo python3 demo/demo3_live_recovery.py` | `udp.port == 5002` | 5002 | ~20s |
+
+### Network Loss Setup (Demo 3 Only)
+```
+BEFORE Demo 3:   sudo tc qdisc add dev lo root netem loss 30%
+AFTER Demo 3:    sudo tc qdisc del dev lo root
+```
 
 ### Between Each Demo
 1. **STOP** the Wireshark capture (red square ⬛)
