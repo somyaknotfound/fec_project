@@ -1,0 +1,570 @@
+<![CDATA[<project>
+  <name>FEC for 5G URLLC</name>
+  <description>
+    Forward Error Correction (FEC) system using GF(256) erasure coding to recover
+    lost UDP packets in 5G Ultra-Reliable Low-Latency Communication networks —
+    without retransmission. Implements a systematic (4,4) code: 4 data packets
+    encoded into 8 total (4 data + 4 parity). Any 4 of the 8 received packets
+    suffice to recover all original data. Code rate = 0.5, max tolerable loss = 50%.
+  </description>
+  <language>Python 3.13</language>
+  <dependencies>matplotlib, numpy (for visualization only)</dependencies>
+
+  <architecture>
+    <overview>
+      6 packages: core (math engine), network (simulation), integration (UDP transport),
+      experiments (A/B testing), analysis (metrics + graphs), config (parameters).
+      ~1,500 lines of Python total.
+    </overview>
+    <diagram>
+      config/ ──► core/ (galois, encoder, decoder)
+                    │
+                    ├──► integration/ (fec_sender, fec_receiver over UDP)
+                    │
+                    └──► experiments/ (experiment_runner)
+                              │
+               network/ ──────┘  (channel_model, packet_loss_simulator,
+                                  traffic_generator, traffic_receiver)
+                              │
+                              └──► analysis/ (metrics_collector, visualizer)
+    </diagram>
+  </architecture>
+
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <!-- MODULE 1: core/galois.py — Galois Field GF(256) Arithmetic -->
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <module name="core/galois.py" lines="132">
+    <purpose>
+      Implements all arithmetic operations in GF(2^8) — the finite field with 256 elements.
+      This is the mathematical foundation for FEC encoding and decoding.
+    </purpose>
+    <theory>
+      GF(256) is a finite field where each element maps to a byte (0-255).
+      - Addition = XOR (no carry)
+      - Multiplication uses pre-computed log/exp lookup tables for O(1) speed
+      - Irreducible polynomial: x^8 + x^4 + x^3 + x^2 + 1 (0x11D, same as AES)
+      - Generator (primitive element): alpha = 2
+      - Every non-zero element has a multiplicative inverse
+    </theory>
+    <implementation>
+      <constants>
+        PRIM_POLY = 0x11D
+        _exp_table[512] — exp_table[i] = alpha^i mod PRIM_POLY (double-sized to avoid modular indexing)
+        _log_table[256] — log_table[v] = i such that alpha^i = v
+      </constants>
+      <functions>
+        _init_tables() — builds log/exp tables at import time by repeated multiplication by alpha=2
+        gf_add(a, b) — returns a XOR b
+        gf_sub = gf_add — subtraction equals addition in GF(2^n)
+        gf_mul(a, b) — returns exp[log[a] + log[b]] (O(1) via tables)
+        gf_div(a, b) — returns exp[(log[a] - log[b]) % 255]
+        gf_inv(a)    — returns exp[255 - log[a]]
+        gf_matrix_mul_vec(matrix, vec) — matrix-vector multiplication over GF(256)
+        gf_matrix_invert(matrix) — Gauss-Jordan elimination to invert a square matrix over GF(256)
+      </functions>
+    </implementation>
+    <source_code><![CDATA[
+"""
+Galois Field GF(256) Arithmetic
+"""
+PRIM_POLY = 0x11D
+_exp_table = [0] * 512
+_log_table = [0] * 256
+
+def _init_tables():
+    x = 1
+    for i in range(255):
+        _exp_table[i] = x
+        _log_table[x] = i
+        x <<= 1
+        if x & 0x100:
+            x ^= PRIM_POLY
+    for i in range(255, 512):
+        _exp_table[i] = _exp_table[i - 255]
+
+_init_tables()
+
+def gf_add(a, b):
+    return a ^ b
+
+gf_sub = gf_add
+
+def gf_mul(a, b):
+    if a == 0 or b == 0:
+        return 0
+    return _exp_table[_log_table[a] + _log_table[b]]
+
+def gf_div(a, b):
+    if b == 0:
+        raise ZeroDivisionError("Division by zero in GF(256)")
+    if a == 0:
+        return 0
+    return _exp_table[(_log_table[a] - _log_table[b]) % 255]
+
+def gf_inv(a):
+    if a == 0:
+        raise ZeroDivisionError("Zero has no inverse in GF(256)")
+    return _exp_table[255 - _log_table[a]]
+
+def gf_matrix_mul_vec(matrix, vec):
+    result = []
+    for row in matrix:
+        val = 0
+        for coeff, v in zip(row, vec):
+            val ^= gf_mul(coeff, v)
+        result.append(val)
+    return result
+
+def gf_matrix_invert(matrix):
+    n = len(matrix)
+    aug = [row[:] + [int(i == j) for j in range(n)] for i, row in enumerate(matrix)]
+    for col in range(n):
+        pivot_row = None
+        for row in range(col, n):
+            if aug[row][col] != 0:
+                pivot_row = row
+                break
+        if pivot_row is None:
+            raise ValueError("Matrix is singular")
+        aug[col], aug[pivot_row] = aug[pivot_row], aug[col]
+        inv_pivot = gf_inv(aug[col][col])
+        aug[col] = [gf_mul(v, inv_pivot) for v in aug[col]]
+        for row in range(n):
+            if row != col and aug[row][col] != 0:
+                factor = aug[row][col]
+                aug[row] = [gf_add(aug[row][j], gf_mul(factor, aug[col][j]))
+                            for j in range(2 * n)]
+    return [row[n:] for row in aug]
+    ]]></source_code>
+  </module>
+
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <!-- MODULE 2: core/fec_encoder.py — FEC Encoder                -->
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <module name="core/fec_encoder.py" lines="125">
+    <purpose>
+      Encodes n_data packets into (n_data + n_parity) packets using a systematic
+      Cauchy matrix construction over GF(256).
+    </purpose>
+    <theory>
+      Systematic code: data packets are sent unchanged, parity packets are computed.
+      Full encoding matrix = [Identity (n_data x n_data)] stacked on top of
+                             [Cauchy   (n_parity x n_data)].
+      Cauchy matrix: C[j][i] = 1 / (x_j XOR y_i) in GF(256)
+        where x_j = n_data + j, y_i = i (disjoint sets).
+      Key property: every square sub-matrix of a Cauchy matrix is invertible,
+      guaranteeing recovery from any n_data received packets.
+      Parity computation per byte position:
+        parity_j[pos] = SUM_i( C[j][i] * data_i[pos] ) in GF(256)
+    </theory>
+    <implementation>
+      <class name="FECEncoder">
+        __init__(n_data_packets=4, n_parity_packets=4) — builds Cauchy matrix
+        _build_cauchy_matrix() — C[j][i] = gf_inv((n_data + j) ^ i)
+        encode_block(data_packets) — pads packets to same length, computes parity,
+          returns [n_data original + n_parity parity] packets
+        get_overhead() — returns (n_parity / n_data) * 100
+        get_encoding_matrix() — returns full (n_data+n_parity) x n_data matrix
+      </class>
+    </implementation>
+    <source_code><![CDATA[
+from core.galois import gf_mul
+
+class FECEncoder:
+    def __init__(self, n_data_packets=4, n_parity_packets=4):
+        self.n_data = n_data_packets
+        self.n_parity = n_parity_packets
+        self.total = n_data_packets + n_parity_packets
+        self.cauchy_matrix = self._build_cauchy_matrix()
+
+    def _build_cauchy_matrix(self):
+        from core.galois import gf_inv
+        matrix = []
+        for j in range(self.n_parity):
+            row = []
+            for i in range(self.n_data):
+                val = (self.n_data + j) ^ i
+                row.append(gf_inv(val))
+            matrix.append(row)
+        return matrix
+
+    def encode_block(self, data_packets):
+        assert len(data_packets) == self.n_data
+        max_len = max(len(p) for p in data_packets)
+        padded = [p + b'\x00' * (max_len - len(p)) for p in data_packets]
+        result = list(padded)
+        for j in range(self.n_parity):
+            parity = bytearray(max_len)
+            for pos in range(max_len):
+                val = 0
+                for i in range(self.n_data):
+                    val ^= gf_mul(self.cauchy_matrix[j][i], padded[i][pos])
+                parity[pos] = val
+            result.append(bytes(parity))
+        return result
+
+    def get_overhead(self):
+        return (self.n_parity / self.n_data) * 100
+
+    def get_encoding_matrix(self):
+        identity = []
+        for i in range(self.n_data):
+            row = [0] * self.n_data
+            row[i] = 1
+            identity.append(row)
+        return identity + self.cauchy_matrix
+    ]]></source_code>
+  </module>
+
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <!-- MODULE 3: core/fec_decoder.py — FEC Decoder                -->
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <module name="core/fec_decoder.py" lines="146">
+    <purpose>
+      Recovers original n_data packets from any n_data received packets (out of
+      n_data + n_parity total) using matrix inversion over GF(256).
+    </purpose>
+    <theory>
+      Recovery algorithm:
+      1. Identify which packets were received (need >= n_data)
+      2. Extract corresponding rows from encoding matrix → sub-matrix S
+      3. Invert S over GF(256) using Gauss-Jordan elimination → S_inv
+      4. For each byte position: multiply S_inv × received_bytes = original_data
+      Fast path: if all n_data data packets present, skip matrix math entirely.
+    </theory>
+    <implementation>
+      <class name="FECDecoder">
+        __init__(n_data_packets=4, n_parity_packets=4)
+        _build_encoding_matrix() — reconstructs identity + Cauchy matrix
+        decode_block(received_packets) — received_packets is list[bytes|None],
+          returns (recovered_data, success)
+        get_statistics() — returns blocks_decoded, blocks_failed, packets_recovered, success_rate
+      </class>
+    </implementation>
+    <source_code><![CDATA[
+from core.galois import gf_mul, gf_matrix_invert
+
+class FECDecoder:
+    def __init__(self, n_data_packets=4, n_parity_packets=4):
+        self.n_data = n_data_packets
+        self.n_parity = n_parity_packets
+        self.total = n_data_packets + n_parity_packets
+        self.encoding_matrix = self._build_encoding_matrix()
+        self.blocks_decoded = 0
+        self.blocks_failed = 0
+        self.packets_recovered = 0
+
+    def _build_encoding_matrix(self):
+        from core.galois import gf_inv
+        matrix = []
+        for i in range(self.n_data):
+            row = [0] * self.n_data
+            row[i] = 1
+            matrix.append(row)
+        for j in range(self.n_parity):
+            row = []
+            for i in range(self.n_data):
+                val = (self.n_data + j) ^ i
+                row.append(gf_inv(val))
+            matrix.append(row)
+        return matrix
+
+    def decode_block(self, received_packets):
+        total = self.n_data + self.n_parity
+        received_indices = [i for i in range(total) if received_packets[i] is not None]
+        if len(received_indices) < self.n_data:
+            self.blocks_failed += 1
+            return None, False
+        data_present = all(received_packets[i] is not None for i in range(self.n_data))
+        if data_present:
+            self.blocks_decoded += 1
+            return list(received_packets[:self.n_data]), True
+        chosen = received_indices[:self.n_data]
+        sub_matrix = [self.encoding_matrix[i][:] for i in chosen]
+        try:
+            inv_matrix = gf_matrix_invert(sub_matrix)
+        except ValueError:
+            self.blocks_failed += 1
+            return None, False
+        pkt_len = max(len(p) for p in received_packets if p is not None)
+        recovered_data = [bytearray(pkt_len) for _ in range(self.n_data)]
+        chosen_packets = [received_packets[i] for i in chosen]
+        for pos in range(pkt_len):
+            col = [p[pos] if pos < len(p) else 0 for p in chosen_packets]
+            for d in range(self.n_data):
+                val = 0
+                for k in range(self.n_data):
+                    val ^= gf_mul(inv_matrix[d][k], col[k])
+                recovered_data[d][pos] = val
+        missing_data = sum(1 for i in range(self.n_data) if received_packets[i] is None)
+        self.packets_recovered += missing_data
+        self.blocks_decoded += 1
+        return [bytes(pkt) for pkt in recovered_data], True
+
+    def get_statistics(self):
+        total = self.blocks_decoded + self.blocks_failed
+        rate = (self.blocks_decoded / total * 100) if total > 0 else 0
+        return {
+            'blocks_decoded': self.blocks_decoded,
+            'blocks_failed': self.blocks_failed,
+            'total_blocks': total,
+            'success_rate': rate,
+            'packets_recovered': self.packets_recovered
+        }
+    ]]></source_code>
+  </module>
+
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <!-- MODULE 4: network/channel_model.py — 5G Latency Simulation -->
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <module name="network/channel_model.py" lines="97">
+    <purpose>Simulates variable propagation delay of a 5G URLLC link.</purpose>
+    <theory>
+      5G latency: URLLC ~1ms, eMBB ~4-10ms, congested ~10-50ms.
+      Delay model: delay = base_delay + jitter (normal or uniform distribution).
+      Does NOT actually sleep — annotates packets with simulated delay for offline analysis.
+    </theory>
+    <implementation>
+      <class name="ChannelModel">
+        __init__(base_delay_ms=2.0, jitter_std_ms=1.0, distribution='normal', seed=None)
+        get_delay() — samples one delay value, records it
+        get_statistics() — returns count, mean, std, min, max, P50, P95, P99
+        reset() — clears recorded delays
+      </class>
+    </implementation>
+  </module>
+
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <!-- MODULE 5: network/packet_loss_simulator.py                 -->
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <module name="network/packet_loss_simulator.py" lines="150">
+    <purpose>Simulates packet loss patterns to test FEC effectiveness.</purpose>
+    <theory>
+      Two models:
+      1. Random (Bernoulli): each packet dropped independently with probability p (i.i.d.)
+      2. Burst (Gilbert-Elliott): two-state Markov chain (GOOD/BAD states).
+         GOOD state: packets delivered (loss ~0). BAD state: packets dropped (loss ~1).
+         Transitions: GOOD→BAD with prob p_gb, BAD→GOOD with prob p_bg.
+         Average burst length ≈ 1/p_bg. Models real wireless fading.
+    </theory>
+    <implementation>
+      <class name="RandomLossSimulator">
+        __init__(loss_rate=0.1, seed=None)
+        apply_loss(packets) — returns list with None replacing dropped packets
+        get_actual_loss_rate() — measured loss rate
+      </class>
+      <class name="BurstLossSimulator">
+        __init__(p_good_to_bad=0.05, p_bad_to_good=0.3, p_loss_good=0.0, p_loss_bad=1.0, seed=None)
+        apply_loss(packets) — Markov-chain-based loss simulation
+        get_actual_loss_rate()
+      </class>
+    </implementation>
+  </module>
+
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <!-- MODULE 6: network/traffic_generator.py & traffic_receiver.py -->
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <module name="network/traffic_generator.py" lines="41">
+    <purpose>Generates real UDP traffic over localhost sockets.</purpose>
+    <implementation>
+      <class name="TrafficGenerator">
+        __init__(dest_ip="127.0.0.1", dest_port=5000)
+        send_packets(num_packets, packet_size=1024, delay=0.1) — sends labeled UDP datagrams
+        close()
+      </class>
+    </implementation>
+  </module>
+  <module name="network/traffic_receiver.py" lines="50">
+    <purpose>Receives UDP traffic.</purpose>
+    <implementation>
+      <class name="TrafficReceiver">
+        __init__(listen_ip="127.0.0.1", listen_port=5000)
+        receive_packets(num_packets, timeout=10) — returns list of received data
+        close()
+      </class>
+    </implementation>
+  </module>
+
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <!-- MODULE 7: integration/fec_sender.py & fec_receiver.py      -->
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <module name="integration/fec_sender.py" lines="76">
+    <purpose>Combines FEC encoder with real UDP sockets for end-to-end FEC transport.</purpose>
+    <theory>
+      Custom packet format: [Block ID: 4B] [Packet Index: 2B] [Total: 2B] [FEC Payload]
+      Buffers incoming data until n_data packets collected, then encodes and sends block.
+    </theory>
+    <implementation>
+      <class name="FECSender">
+        __init__(dest_ip, dest_port, n_data=4, n_parity=4)
+        send_data(data_payload) — buffers data, encodes + sends when block is full
+        flush() — sends any remaining buffered packets (padded)
+        close()
+      </class>
+    </implementation>
+  </module>
+  <module name="integration/fec_receiver.py" lines="96">
+    <purpose>Receives FEC-protected UDP data, reassembles blocks, decodes.</purpose>
+    <implementation>
+      <class name="FECReceiver">
+        __init__(listen_ip, listen_port, n_data=4, n_parity=4)
+        receive_blocks(num_blocks, timeout=30) — receives packets, groups by block_id,
+          attempts decoding when enough packets arrive for a block
+        get_statistics()
+        close()
+      </class>
+    </implementation>
+  </module>
+
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <!-- MODULE 8: experiments/experiment_runner.py                  -->
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <module name="experiments/experiment_runner.py" lines="269">
+    <purpose>
+      Runs controlled A/B experiments comparing FEC vs no-FEC under varying
+      channel loss conditions.
+    </purpose>
+    <theory>
+      For each loss rate (0%, 5%, 10%, ..., 50%):
+        - Baseline: send N packets, simulate loss, count survivors
+        - With FEC: encode N→(N+K), simulate loss, decode, count recovered
+      Multiple trials per rate for statistical significance.
+      Metrics: PLR, recovery rate, effective throughput, FEC overhead.
+    </theory>
+    <implementation>
+      <class name="ExperimentRunner">
+        __init__(n_data=4, n_parity=4, num_blocks=50, num_trials=5)
+        run_all_experiments(loss_rates) — sweeps 9 loss rates for both random and burst loss
+        _run_loss_sweep(loss_rates, loss_type) — runs all trials at each loss rate
+        _run_single_trial(loss_rate, seed, loss_type) — one complete encode→loss→decode trial
+        _run_latency_experiment() — compares delay with/without FEC
+        save_results(results, filepath) — saves to JSON
+      </class>
+    </implementation>
+  </module>
+
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <!-- MODULE 9: analysis/metrics_collector.py & visualizer.py    -->
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <module name="analysis/metrics_collector.py" lines="58">
+    <purpose>Aggregates experiment results into formatted ASCII tables.</purpose>
+    <implementation>
+      <class name="MetricsCollector">
+        add_result(channel_loss, no_fec_plr, fec_plr, recovery_rate, overhead, ...)
+        print_summary_table() — formatted results table
+        get_records() — returns raw records
+      </class>
+    </implementation>
+  </module>
+  <module name="analysis/visualizer.py" lines="233">
+    <purpose>Generates 4 publication-ready matplotlib plots.</purpose>
+    <implementation>
+      <class name="Visualizer">
+        generate_all(results) — calls all 4 plot functions
+        plot_plr_comparison(results) — PLR with/without FEC (random + burst side-by-side)
+        plot_recovery_rate(results) — block recovery rate vs 5G URLLC targets (99.999%)
+        plot_throughput_comparison(results) — effective throughput trade-off
+        plot_latency_cdf(results) — CDF of packet delivery latency
+      </class>
+    </implementation>
+  </module>
+
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <!-- MODULE 10: config/                                          -->
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <module name="config/fec_config.py" lines="26">
+    <implementation>
+      <class name="FECConfig">
+        N_DATA_PACKETS = 4
+        N_PARITY_PACKETS = 4
+        MAX_PAYLOAD_SIZE = 1024
+        HEADER_SIZE = 16
+        USE_SYSTEMATIC_CODE = True
+      </class>
+    </implementation>
+  </module>
+  <module name="config/network_config.py" lines="17">
+    <implementation>
+      <class name="NetworkConfig">
+        SENDER_IP = "127.0.0.1"
+        TEST_PORT = 5000
+        PACKET_TIMEOUT = 5.0
+      </class>
+    </implementation>
+  </module>
+
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <!-- DEMO SCRIPTS                                                -->
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <demos>
+    <demo name="demo/demo1_no_fec.py" port="5000">
+      Baseline: sends 10 UDP packets with NO FEC. Shows packet loss is permanent.
+    </demo>
+    <demo name="demo/demo2_with_fec.py" port="5001">
+      Sends 1 FEC block (4 data → 8 total). Shows FEC header structure in Wireshark.
+      Header: [Block ID: 4B] [Packet Idx: 2B] [Total: 2B].
+    </demo>
+    <demo name="demo/demo3_live_recovery.py" port="5002">
+      Live loss + recovery. On Linux with sudo, uses tc netem for kernel-level 30% loss.
+      Wireshark shows genuinely missing packets. Falls back to application-level simulation.
+    </demo>
+    <demo name="demo/demo4_controlled_recovery.py" port="5003">
+      Best demo for presentations. Sender encodes 8 packets but SKIPS sending packets
+      at LOST_PACKET_INDICES (default [1,3]), simulating network loss. Wireshark shows
+      only 6 packets with gaps in sequence numbers. Receiver runs FEC decoding, recovers
+      the missing data, and verifies byte-for-byte match. Configurable — can lose up to
+      4 packets (even all 4 data packets) and still recover.
+    </demo>
+  </demos>
+
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <!-- KEY FORMULAS AND THEORETICAL RESULTS                        -->
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <theory_summary>
+    <formula name="Code Rate">k / (k + r) = 4 / 8 = 0.5</formula>
+    <formula name="Max Tolerable Loss">r / (k + r) = 4 / 8 = 50%</formula>
+    <formula name="Bandwidth Overhead">r / k = 4 / 4 = 100%</formula>
+    <formula name="GF(256) Multiplication">a × b = exp[log[a] + log[b]]</formula>
+    <formula name="GF(256) Division">a ÷ b = exp[(log[a] - log[b]) mod 255]</formula>
+    <formula name="GF(256) Inverse">1/a = exp[255 - log[a]]</formula>
+    <formula name="Cauchy Matrix Entry">C[j][i] = 1 / (x_j XOR y_i) in GF(256)</formula>
+    <formula name="Parity Computation">parity_j[pos] = XOR_i( C[j][i] * data_i[pos] )</formula>
+    <formula name="Recovery">S_inv × received_bytes = original_data (per byte position)</formula>
+    <result>Under random loss, FEC reduces effective PLR to near-zero for channel loss up to 40%.</result>
+    <result>Under burst loss (Gilbert-Elliott), FEC maintains >95% block recovery for loss up to 30%.</result>
+    <result>FEC introduces 100% bandwidth overhead (code rate 0.5), justified for URLLC where retransmission latency is unacceptable.</result>
+  </theory_summary>
+
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <!-- PROJECT CONTEXT                                             -->
+  <!-- ════════════════════════════════════════════════════════════ -->
+  <context>
+    <academic_purpose>
+      This is a final-year / academic project demonstrating how Forward Error Correction
+      can improve reliability in 5G URLLC networks. The project includes a complete
+      implementation from mathematical foundations (GF(256) arithmetic) to network
+      simulation, experimentation, visualization, and live Wireshark demonstrations.
+    </academic_purpose>
+    <file_map>
+      core/galois.py             — 132 lines — GF(256) arithmetic + matrix operations
+      core/fec_encoder.py        — 125 lines — Cauchy matrix encoding
+      core/fec_decoder.py        — 146 lines — Matrix inversion decoding
+      network/channel_model.py   —  97 lines — 5G latency simulation
+      network/packet_loss_simulator.py — 150 lines — Random + burst loss models
+      network/traffic_generator.py     —  41 lines — UDP packet sender
+      network/traffic_receiver.py      —  50 lines — UDP packet receiver
+      integration/fec_sender.py  —  76 lines — FEC + UDP sender
+      integration/fec_receiver.py—  96 lines — FEC + UDP receiver
+      experiments/experiment_runner.py — 269 lines — A/B experiment suite
+      analysis/metrics_collector.py    —  58 lines — Results aggregation
+      analysis/visualizer.py           — 233 lines — Publication-quality graphs (4 types)
+      config/fec_config.py       —  26 lines — FEC parameters
+      config/network_config.py   —  17 lines — Network parameters
+      demo/demo1_no_fec.py       — 101 lines — Baseline demo
+      demo/demo2_with_fec.py     — 151 lines — FEC structure demo
+      demo/demo3_live_recovery.py— 404 lines — Live kernel-level loss demo
+      demo/demo4_controlled_recovery.py — 340 lines — Controlled loss + recovery (best demo)
+    </file_map>
+  </context>
+</project>
+]]>
