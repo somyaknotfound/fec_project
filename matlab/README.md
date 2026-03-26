@@ -1,5 +1,11 @@
 # MATLAB 5G Simulation — Step-by-Step Guide
 
+**B.Tech Mini-Project — Data Communications & Networks**  
+**Students:** Shivam Kumar (241CS255), Somyak Priyadarshi Mohanta (241CS257)  
+**Institution:** NITK Surathkal, Department of Computer Science & Engineering  
+**Guide:** BR Chandravarkar, NITK Surathkal  
+**Course:** CS255 - Data Communications
+
 Get real 5G channel data into your Python FEC project using MATLAB Online.
 Total time: **~20 minutes** (setup + run + integrate).
 

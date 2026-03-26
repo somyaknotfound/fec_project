@@ -6,6 +6,11 @@
 > without retransmission**, targeting ultra-reliable low-latency communication
 > (URLLC) scenarios in 5G networks.
 
+**Students:** Shivam Kumar (241CS255), Somyak Priyadarshi Mohanta (241CS257)  
+**Institution:** NITK Surathkal, Department of Computer Science & Engineering  
+**Guide:** BR Chandravarkar, NITK Surathkal  
+**Course:** CS255 - Data Communications (CS255)
+
 [![Python](https://img.shields.io/badge/Python-3.13-blue?logo=python)](https://www.python.org/)
 [![FEC](https://img.shields.io/badge/FEC-GF(256)_Cauchy-green)]()
 [![Status](https://img.shields.io/badge/Status-Complete-brightgreen)]()

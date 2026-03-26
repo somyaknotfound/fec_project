@@ -1,5 +1,11 @@
 # FEC Wireshark Demo — Quick Start
 
+**B.Tech Mini-Project — Data Communications & Networks**  
+**Students:** Shivam Kumar (241CS255), Somyak Priyadarshi Mohanta (241CS257)  
+**Institution:** NITK Surathkal, Department of Computer Science & Engineering  
+**Guide:** BR Chandravarkar, NITK Surathkal  
+**Course:** CS255 - Data Communications
+
 ## Prerequisites
 - Python 3.13+
 - Wireshark installed (for packet visualization)
